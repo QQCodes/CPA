@@ -93,26 +93,23 @@ def kmeans_clustering(img_embeds, txt_embeds, args):
             image_embeds_norm = normalize(img_embeds, axis=1)
             text_embeds_norm = normalize(txt_embeds, axis=1)
 
-            # === 方向F：normalize 分支同样使用融合特征聚类 ===
+            # === The normalize branch also uses fused feature clustering ===
             joint_alpha = getattr(args, 'joint_alpha', 0.5)
             joint_feats = joint_alpha * image_embeds_norm + (1 - joint_alpha) * text_embeds_norm
             joint_feats = joint_feats / np.linalg.norm(joint_feats, axis=1, keepdims=True)
 
-            # kmeans_joint = MiniBatchKMeans(n_clusters=args.num_pairs, random_state=42, batch_size=10000, n_init=20)
-            # joint_labels = kmeans_joint.fit_predict(joint_feats)
-
-            # 3. 两阶段聚类：先粗后细
+            # Two-stage clustering: coarse-to-fine
             n_coarse = min(n_clusters_over * 5, len(joint_feats) // 2)
             kmeans_coarse = MiniBatchKMeans(n_clusters=n_coarse, random_state=42, batch_size=10000, n_init=10)
             coarse_labels = kmeans_coarse.fit_predict(joint_feats)
 
-            # 对粗 cluster 的中心再聚到 num_pairs 个
+            # The coarse cluster is then clustered back to num_pairs.
             coarse_centers = kmeans_coarse.cluster_centers_.astype(np.float32)
             coarse_centers_norm = coarse_centers / np.linalg.norm(coarse_centers, axis=1, keepdims=True)
             kmeans_fine = MiniBatchKMeans(n_clusters=n_clusters_over, random_state=42, batch_size=n_coarse, n_init=20)
             fine_labels_of_coarse = kmeans_fine.fit_predict(coarse_centers_norm)
 
-            # 把细 label 映射回原始样本
+            # Map the fine labels back to the original samples
             joint_labels = fine_labels_of_coarse[coarse_labels]
 
 
@@ -129,27 +126,19 @@ def kmeans_clustering(img_embeds, txt_embeds, args):
 
 
         else:
-            # === 方向F：pair信息引导的联合聚类 ===
-            # 1. 对两个模态的 embedding 分别 L2 归一化
             img_norm = img_embeds / np.linalg.norm(img_embeds, axis=1, keepdims=True)
             txt_norm = txt_embeds / np.linalg.norm(txt_embeds, axis=1, keepdims=True)
 
-            # 2. 构建融合特征：alpha 控制图像/文本的贡献比例
-            #    alpha=0.5 表示等权融合；可以作为超参数加入 args
             joint_alpha = getattr(args, 'joint_alpha', 0.5)
             joint_feats = joint_alpha * img_norm + (1 - joint_alpha) * txt_norm
-            # 再做一次 L2 归一化，让聚类在超球面上进行
             joint_feats = joint_feats / np.linalg.norm(joint_feats, axis=1, keepdims=True)
 
-            # 3. 用融合特征驱动聚类，得到每个样本的 cluster 归属
             kmeans_joint = MiniBatchKMeans(n_clusters=n_clusters_over, random_state=42, batch_size=10000, n_init=20)
             joint_labels = kmeans_joint.fit_predict(joint_feats)
 
-            # 4. 两个模态共享同一套 label（核心：pair-level 对齐）
             img_labels = joint_labels
             txt_labels = joint_labels
 
-            # 5. cluster center 回到原始 embedding 空间中计算（加权均值）
             img_centers = np.zeros((args.num_pairs, img_embeds.shape[1]), dtype=np.float32)
             txt_centers = np.zeros((args.num_pairs, txt_embeds.shape[1]), dtype=np.float32)
             for k in range(args.num_pairs):
@@ -158,19 +147,9 @@ def kmeans_clustering(img_embeds, txt_embeds, args):
                     img_centers[k] = img_embeds[idx].mean(axis=0)
                     txt_centers[k] = txt_embeds[idx].mean(axis=0)
 
-
-        # df = pd.DataFrame({'index': np.arange(len(img_labels)), 'img_cluster': img_labels, 'txt_cluster': txt_labels})
-
-        # count_table = df.groupby(['img_cluster', 'txt_cluster']).size().unstack(fill_value=0)
-        # cost_matrix = -count_table.values
-        # img_idxs, txt_idxs = linear_sum_assignment(cost_matrix)
-
-        # 计算每个 pair 的 CLIP cosine similarity 作为权重
         norm_img_all = img_embeds / np.linalg.norm(img_embeds, axis=1, keepdims=True)
         norm_txt_all = txt_embeds / np.linalg.norm(txt_embeds, axis=1, keepdims=True)
         pair_sims = np.sum(norm_img_all * norm_txt_all, axis=1)  # shape: (N,)
-
-        # 构建加权代价矩阵：每个 (img_cluster_i, txt_cluster_j) 格子的值为该格内所有 pair 的 CLIP sim 之和
         num_img_clusters = len(np.unique(img_labels))
         num_txt_clusters = len(np.unique(txt_labels))
         weighted_cost_table = np.zeros((num_img_clusters, num_txt_clusters), dtype=np.float64)
@@ -198,35 +177,27 @@ def kmeans_clustering(img_embeds, txt_embeds, args):
     return joblib.load(img_center_path), joblib.load(txt_center_path)
 
 def greedy_max_min_select(img_centers, txt_centers, num_select):
-    """
-    从候选prototypes中用贪心max-min distance选出num_select个最多样化的pair。
-    联合考虑image和text两个模态的距离。
-    """
     n = len(img_centers)
     assert n >= num_select, f"候选数 {n} 少于需要选的数量 {num_select}"
 
-    # 对两个模态分别做L2归一化，然后拼接成联合表示
     norm_img = img_centers / (np.linalg.norm(img_centers, axis=1, keepdims=True) + 1e-8)
     norm_txt = txt_centers / (np.linalg.norm(txt_centers, axis=1, keepdims=True) + 1e-8)
-    # 拼接联合特征，图像和文本各占一半权重
     joint = np.concatenate([norm_img, norm_txt], axis=1)  # shape: (n, 2*dim)
 
     selected = []
-    # 从和整体均值最近的那个点开始（更稳定，避免从极端点开始）
     mean_joint = joint.mean(axis=0, keepdims=True)
     first_idx = int(np.argmin(np.linalg.norm(joint - mean_joint, axis=1)))
     selected.append(first_idx)
 
-    # min_dists[i] = i到已选集合中最近点的距离
     min_dists = np.linalg.norm(joint - joint[first_idx], axis=1)
-    min_dists[first_idx] = -1.0  # 标记已选
+    min_dists[first_idx] = -1.0
 
     for _ in range(num_select - 1):
         next_idx = int(np.argmax(min_dists))
         selected.append(next_idx)
         new_dists = np.linalg.norm(joint - joint[next_idx], axis=1)
         min_dists = np.minimum(min_dists, new_dists)
-        min_dists[next_idx] = -1.0  # 标记已选
+        min_dists[next_idx] = -1.0
 
     return np.array(selected)
 
@@ -245,23 +216,18 @@ def match_and_sort_centers(img_labels, txt_labels, img_idxs, txt_idxs, img_cente
             matched_img_centers.append(img_centers[i])
             matched_txt_centers.append(txt_centers[j])
 
-        # else:
-        #     matched_img_centers.append(img_embeds[mask].mean(axis=0))
-        #     matched_txt_centers.append(txt_embeds[mask].mean(axis=0))
-
         else:
-            # 计算该 matched cluster 内所有 shared pair 的 CLIP cosine similarity 作为权重
             masked_img = img_embeds[mask]
             masked_txt = txt_embeds[mask]
             norm_i = masked_img / np.linalg.norm(masked_img, axis=1, keepdims=True)
             norm_t = masked_txt / np.linalg.norm(masked_txt, axis=1, keepdims=True)
             weights = np.sum(norm_i * norm_t, axis=1)  # shape: (num_matched,)
-            weights = np.clip(weights, 0, None)         # 去除极少数负相似度的干扰
+            weights = np.clip(weights, 0, None)
 
             if len(weights) >= 4:
                 local_median = np.median(weights)
                 local_keep = weights >= local_median * 0.85
-                if local_keep.sum() >= 2:  # 至少保留2个样本
+                if local_keep.sum() >= 2:
                     masked_img = masked_img[local_keep]
                     masked_txt = masked_txt[local_keep]
                     weights = weights[local_keep]
@@ -343,8 +309,8 @@ def compute_self_sim(img_embeds, txt_embeds, args, prune=False):
 def generate_syn_img(img_emdeds, sentence_list, img_path, args):
     if sentence_list is not None:
         assert len(img_emdeds) == len(sentence_list), "Image and text embeddings must have the same length"
-    
-    decoder_pipe = StableUnCLIPImg2ImgPipeline.from_pretrained("/opt/data/private/Models/stable-diffusion-2-1-unclip-small", torch_dtype=torch.float16).to(args.device)
+
+    decoder_pipe = StableUnCLIPImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-2-1-unclip-small", torch_dtype=torch.float16).to(args.device)
 
     if sentence_list is None:
         sentence_list = [""]*len(img_emdeds)  # Default empty prompt if none provided
